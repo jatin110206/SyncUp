@@ -15,7 +15,20 @@ const chatSchema = new mongoose.Schema({
         type: Number,
         default: 0,
     },
-    
+    // Group chat fields
+    isGroupChat: {
+        type: Boolean,
+        default: false,
+    },
+    groupName: {
+        type: String,
+        default: null,
+    },
+    groupAdmin: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+        default: null,
+    },
 }, { timestamps: true });
 
 const Chat = mongoose.model("Chat", chatSchema);

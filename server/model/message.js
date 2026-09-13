@@ -11,11 +11,27 @@ const messageSchema = new mongoose.Schema({
         ref: "User",
         required: true,
     },
+    // text is optional if an image is provided
     text: {
         type: String,
-        required: true,
+        default: "",
+    },
+    // Optional image attachment (Cloudinary URL)
+    image: {
+        type: String,
+        default: null,
     },
     read: {
+        type: Boolean,
+        default: false,
+    },
+    // Soft delete — message content is replaced but document kept for chat history integrity
+    isDeleted: {
+        type: Boolean,
+        default: false,
+    },
+    // Flag set when a user edits a message
+    isEdited: {
         type: Boolean,
         default: false,
     },
