@@ -1,5 +1,8 @@
 const path = require('path');
-require('dotenv').config({ path: path.resolve(__dirname, 'config.env') });
+// In production (Railway), env vars are injected by the platform — no config.env file needed
+if (process.env.NODE_ENV !== 'production') {
+    require('dotenv').config({ path: path.resolve(__dirname, 'config.env') });
+}
 const http = require('http');
 const mongoose = require('mongoose');
 
@@ -30,7 +33,8 @@ server.on('error', (err) => {
 // Initialize Socket.io
 initSocket(server);
 
-const PORT = process.env.PORT_NUMBER || 3000;
+// Railway injects PORT automatically; PORT_NUMBER is used for local dev
+const PORT = process.env.PORT || process.env.PORT_NUMBER || 3000;
 const listeningServer = server.listen(PORT, () => {
     console.log(`SyncUp Server is running on port ${PORT}`);
 });

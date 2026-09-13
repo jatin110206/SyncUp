@@ -32,10 +32,14 @@ const allowedOrigins = [
 
 app.use(cors({
     origin: function (origin, callback) {
+        // Allow server-to-server requests (no origin) or listed origins
         if (!origin || allowedOrigins.includes(origin)) {
             callback(null, true);
+        } else if (process.env.NODE_ENV !== 'production') {
+            // Permissive in development
+            callback(null, true);
         } else {
-            callback(null, true); // Permissive in development
+            callback(new Error(`CORS: Origin ${origin} not allowed`));
         }
     },
     credentials: true,

@@ -1,1 +1,22 @@
+# Secrets
 config.env
+.env
+.env.local
+.env.production
+
+# Dependencies
+node_modules/
+client/node_modules/
+server/node_modules/
+
+# Build outputs
+client/dist/
+client/.vite/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
