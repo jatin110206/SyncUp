@@ -1,0 +1,11 @@
+{
+  "name": "syncup-root",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "npm --prefix server start",
+    "dev": "npm --prefix server run dev"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2"
+  }
+}
