@@ -11,12 +11,12 @@ const chatSchema = new mongoose.Schema({
         type: String,
         default: "",
     },
-    lastMessageTime: {
-        type: Date,
-        default: null,
+    unreadCount: {
+        type: Number,
+        default: 0,
     },
-}
-);
+    
+}, { timestamps: true });
 
 const Chat = mongoose.model("Chat", chatSchema);
 
