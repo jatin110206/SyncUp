@@ -3,18 +3,26 @@ const authMiddleware = require('../middleware/authMiddleware');
 const Chat = require('../model/chat');
 
 // ─────────────────────────────────────────────────────────
-// POST /api/chat/createNewChat
-// Create a one-on-one chat between two users
+// POST /api/chat/createChat OR /api/chat/createNewChat
+// Create or retrieve a 1-on-1 chat between two users
+// Supports { recepientId } OR { members }
 // ─────────────────────────────────────────────────────────
-router.post('/createNewChat', authMiddleware, async (req, res) => {
+router.post(['/createChat', '/createNewChat'], authMiddleware, async (req, res) => {
     try {
-        const { members } = req.body || {};
+        const userId = req.userData?.userId || req.userData?.id;
+        let { recepientId, recipientId, targetUserId, members } = req.body || {};
 
-        if (!members || members.length < 2) {
-            return res.status(400).json({ message: 'At least 2 members are required to create a chat!' });
+        const targetId = recepientId || recipientId || targetUserId;
+
+        if (!members && targetId) {
+            members = [userId.toString(), targetId.toString()];
         }
 
-        // Check if 1-on-1 chat already exists between these two users
+        if (!members || members.length < 2) {
+            return res.status(400).json({ message: 'Recepient ID or at least 2 members are required!' });
+        }
+
+        // Check if 1-on-1 chat already exists between these users
         if (members.length === 2) {
             const existingChat = await Chat.findOne({
                 isGroupChat: false,
@@ -22,7 +30,13 @@ router.post('/createNewChat', authMiddleware, async (req, res) => {
             }).populate('members', '-password');
 
             if (existingChat) {
-                return res.status(200).json({ chat: existingChat, alreadyExists: true });
+                const uIdStr = userId.toString();
+                const chatObj = existingChat.toObject();
+                if (!existingChat.isGroupChat && existingChat.members) {
+                    const other = existingChat.members.find((m) => (m._id || m.id || m)?.toString() !== uIdStr);
+                    chatObj.isBlockedByOther = Boolean(other?.blockedUsers?.some((bId) => (bId?._id || bId)?.toString() === uIdStr));
+                }
+                return res.status(200).json({ chat: chatObj, alreadyExists: true });
             }
         }
 
@@ -36,6 +50,17 @@ router.post('/createNewChat', authMiddleware, async (req, res) => {
         const savedChat = await chat.save();
         const populated = await savedChat.populate('members', '-password');
 
+        try {
+            const { getIO } = require('../socket/socket');
+            const io = getIO();
+            populated.members.forEach((m) => {
+                const mId = (m._id || m.id || m).toString();
+                io.to(mId).emit('new-chat-created', populated);
+            });
+        } catch (sErr) {
+            console.error('[chatController] Socket emit error:', sErr.message);
+        }
+
         res.status(201).json({ chat: populated });
     } catch (err) {
         console.error('Error creating new chat:', err);
@@ -44,22 +69,32 @@ router.post('/createNewChat', authMiddleware, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────
-// GET /api/chat/allChats
+// GET /api/chat/getChats OR /api/chat/allChats
 // Get all chats the authenticated user is part of
 // ─────────────────────────────────────────────────────────
-router.get('/allChats', authMiddleware, async (req, res) => {
+router.get(['/getChats', '/allChats'], authMiddleware, async (req, res) => {
     try {
         const userId = req.userData?.userId || req.userData?.id;
         if (!userId) {
             return res.status(400).json({ message: 'User ID not found in token!' });
         }
 
+        const uIdStr = userId.toString();
         const chats = await Chat.find({ members: { $in: [userId] } })
             .populate('members', '-password')
             .populate('groupAdmin', '-password')
             .sort({ updatedAt: -1 });
 
-        res.status(200).json({ chats });
+        const formattedChats = chats.map((chat) => {
+            const chatObj = chat.toObject();
+            if (!chat.isGroupChat && chat.members) {
+                const other = chat.members.find((m) => m._id?.toString() !== uIdStr);
+                chatObj.isBlockedByOther = other?.blockedUsers?.some((bId) => bId.toString() === uIdStr) || false;
+            }
+            return chatObj;
+        });
+
+        res.status(200).json({ chats: formattedChats });
     } catch (err) {
         console.error('Error fetching all chats:', err);
         res.status(500).json({ message: 'Fetching chats failed!', error: err.message });
@@ -67,13 +102,47 @@ router.get('/allChats', authMiddleware, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────
-// PATCH /api/chat/clearUnread/:chatId
-// Clear unread message count for a specific chat
+// GET /api/chat/getChat/:chatId
+// Fetch a single chat by ID
 // ─────────────────────────────────────────────────────────
-router.patch('/clearUnread/:chatId', authMiddleware, async (req, res) => {
+router.get('/getChat/:chatId', authMiddleware, async (req, res) => {
     try {
+        const userId = req.userData?.userId || req.userData?.id;
+        const chat = await Chat.findById(req.params.chatId)
+            .populate('members', '-password')
+            .populate('groupAdmin', '-password');
+
+        if (!chat) {
+            return res.status(404).json({ message: 'Chat not found!' });
+        }
+
+        const uIdStr = userId ? userId.toString() : '';
+        const chatObj = chat.toObject();
+        if (!chat.isGroupChat && chat.members) {
+            const other = chat.members.find((m) => m._id?.toString() !== uIdStr);
+            chatObj.isBlockedByOther = other?.blockedUsers?.some((bId) => bId.toString() === uIdStr) || false;
+        }
+
+        res.status(200).json({ chat: chatObj });
+    } catch (err) {
+        console.error('Error fetching chat:', err);
+        res.status(500).json({ message: 'Fetching chat failed!', error: err.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────
+// PUT or PATCH /api/chat/clearUnread OR /api/chat/clearUnread/:chatId
+// Clear unread message count for a chat
+// ─────────────────────────────────────────────────────────
+const clearUnreadHandler = async (req, res) => {
+    try {
+        const chatId = req.params.chatId || req.body?.chatId;
+        if (!chatId) {
+            return res.status(400).json({ message: 'Chat ID is required!' });
+        }
+
         const chat = await Chat.findByIdAndUpdate(
-            req.params.chatId,
+            chatId,
             { $set: { unreadCount: 0 } },
             { returnDocument: 'after' }
         ).populate('members', '-password');
@@ -82,16 +151,19 @@ router.patch('/clearUnread/:chatId', authMiddleware, async (req, res) => {
             return res.status(404).json({ message: 'Chat not found!' });
         }
 
-        res.status(200).json({ chat });
+        res.status(200).json({ message: 'Unread count cleared!', chat });
     } catch (err) {
         console.error('Error clearing unread count:', err);
         res.status(500).json({ message: 'Clearing unread count failed!', error: err.message });
     }
-});
+};
+
+router.put(['/clearUnread', '/clearUnread/:chatId'], authMiddleware, clearUnreadHandler);
+router.patch(['/clearUnread', '/clearUnread/:chatId'], authMiddleware, clearUnreadHandler);
 
 // ─────────────────────────────────────────────────────────
 // POST /api/chat/createGroupChat
-// Create a group chat with a name and multiple members
+// Create a group chat with name and members
 // ─────────────────────────────────────────────────────────
 router.post('/createGroupChat', authMiddleware, async (req, res) => {
     try {
@@ -105,7 +177,6 @@ router.post('/createGroupChat', authMiddleware, async (req, res) => {
             return res.status(400).json({ message: 'A group requires at least 2 other members!' });
         }
 
-        // Add admin to members if not already included
         const allMembers = members.includes(adminId.toString())
             ? members
             : [adminId.toString(), ...members];
@@ -125,7 +196,7 @@ router.post('/createGroupChat', authMiddleware, async (req, res) => {
             { path: 'groupAdmin', select: '-password' }
         ]);
 
-        res.status(201).json({ chat: populated });
+        res.status(201).json({ message: 'Group chat created successfully!', chat: populated });
     } catch (err) {
         console.error('Error creating group chat:', err);
         res.status(500).json({ message: 'Creating group chat failed!', error: err.message });
@@ -133,19 +204,19 @@ router.post('/createGroupChat', authMiddleware, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────
-// PATCH /api/chat/renameGroup/:chatId
+// PUT or PATCH /api/chat/renameGroup OR /api/chat/renameGroup/:chatId
 // Rename a group chat (admin only)
 // ─────────────────────────────────────────────────────────
-router.patch('/renameGroup/:chatId', authMiddleware, async (req, res) => {
+const renameGroupHandler = async (req, res) => {
     try {
+        const chatId = req.params.chatId || req.body?.chatId;
         const { groupName } = req.body || {};
         const userId = req.userData?.userId || req.userData?.id;
 
-        if (!groupName || !groupName.trim()) {
-            return res.status(400).json({ message: 'New group name is required!' });
-        }
+        if (!chatId) return res.status(400).json({ message: 'Chat ID is required!' });
+        if (!groupName || !groupName.trim()) return res.status(400).json({ message: 'Group name is required!' });
 
-        const chat = await Chat.findById(req.params.chatId);
+        const chat = await Chat.findById(chatId);
         if (!chat) return res.status(404).json({ message: 'Chat not found!' });
         if (!chat.isGroupChat) return res.status(400).json({ message: 'This is not a group chat!' });
         if (chat.groupAdmin.toString() !== userId.toString()) {
@@ -153,7 +224,7 @@ router.patch('/renameGroup/:chatId', authMiddleware, async (req, res) => {
         }
 
         const updated = await Chat.findByIdAndUpdate(
-            req.params.chatId,
+            chatId,
             { $set: { groupName: groupName.trim() } },
             { returnDocument: 'after' }
         ).populate([
@@ -161,77 +232,80 @@ router.patch('/renameGroup/:chatId', authMiddleware, async (req, res) => {
             { path: 'groupAdmin', select: '-password' }
         ]);
 
-        res.status(200).json({ chat: updated });
+        res.status(200).json({ message: 'Group name updated successfully!', chat: updated });
     } catch (err) {
         console.error('Error renaming group:', err);
         res.status(500).json({ message: 'Renaming group failed!', error: err.message });
     }
-});
+};
+
+router.put(['/renameGroup', '/renameGroup/:chatId'], authMiddleware, renameGroupHandler);
+router.patch(['/renameGroup', '/renameGroup/:chatId'], authMiddleware, renameGroupHandler);
 
 // ─────────────────────────────────────────────────────────
-// PATCH /api/chat/addToGroup/:chatId
-// Add a member to a group chat (admin only)
+// PUT or PATCH /api/chat/addGroupMembers OR /api/chat/addToGroup/:chatId
+// Add member(s) to a group chat (admin only)
 // ─────────────────────────────────────────────────────────
-router.patch('/addToGroup/:chatId', authMiddleware, async (req, res) => {
+const addMembersHandler = async (req, res) => {
     try {
-        const { userId: newMemberId } = req.body || {};
+        const chatId = req.params.chatId || req.body?.chatId;
+        const { userId: newMemberId, members } = req.body || {};
         const requesterId = req.userData?.userId || req.userData?.id;
 
-        if (!newMemberId) {
-            return res.status(400).json({ message: 'User ID to add is required!' });
+        const toAdd = members || (newMemberId ? [newMemberId] : []);
+        if (!chatId || toAdd.length === 0) {
+            return res.status(400).json({ message: 'Chat ID and member(s) are required!' });
         }
 
-        const chat = await Chat.findById(req.params.chatId);
+        const chat = await Chat.findById(chatId);
         if (!chat) return res.status(404).json({ message: 'Chat not found!' });
         if (!chat.isGroupChat) return res.status(400).json({ message: 'This is not a group chat!' });
         if (chat.groupAdmin.toString() !== requesterId.toString()) {
             return res.status(403).json({ message: 'Only the group admin can add members!' });
         }
-        if (chat.members.map(m => m.toString()).includes(newMemberId)) {
-            return res.status(400).json({ message: 'User is already in the group!' });
-        }
 
         const updated = await Chat.findByIdAndUpdate(
-            req.params.chatId,
-            { $push: { members: newMemberId } },
+            chatId,
+            { $addToSet: { members: { $each: toAdd } } },
             { returnDocument: 'after' }
         ).populate([
             { path: 'members', select: '-password' },
             { path: 'groupAdmin', select: '-password' }
         ]);
 
-        res.status(200).json({ chat: updated });
+        res.status(200).json({ message: 'Members added successfully!', chat: updated });
     } catch (err) {
-        console.error('Error adding member to group:', err);
-        res.status(500).json({ message: 'Adding member to group failed!', error: err.message });
+        console.error('Error adding members:', err);
+        res.status(500).json({ message: 'Adding members failed!', error: err.message });
     }
-});
+};
+
+router.put(['/addGroupMembers', '/addToGroup', '/addToGroup/:chatId'], authMiddleware, addMembersHandler);
+router.patch(['/addGroupMembers', '/addToGroup', '/addToGroup/:chatId'], authMiddleware, addMembersHandler);
 
 // ─────────────────────────────────────────────────────────
-// PATCH /api/chat/removeFromGroup/:chatId
-// Remove a member from a group chat (admin only)
+// PUT or PATCH /api/chat/removeGroupMember OR /api/chat/removeFromGroup/:chatId
+// Remove member from group chat (admin only)
 // ─────────────────────────────────────────────────────────
-router.patch('/removeFromGroup/:chatId', authMiddleware, async (req, res) => {
+const removeMemberHandler = async (req, res) => {
     try {
-        const { userId: removeMemberId } = req.body || {};
+        const chatId = req.params.chatId || req.body?.chatId;
+        const removeMemberId = req.body?.memberId || req.body?.userId;
         const requesterId = req.userData?.userId || req.userData?.id;
 
-        if (!removeMemberId) {
-            return res.status(400).json({ message: 'User ID to remove is required!' });
+        if (!chatId || !removeMemberId) {
+            return res.status(400).json({ message: 'Chat ID and member ID are required!' });
         }
 
-        const chat = await Chat.findById(req.params.chatId);
+        const chat = await Chat.findById(chatId);
         if (!chat) return res.status(404).json({ message: 'Chat not found!' });
         if (!chat.isGroupChat) return res.status(400).json({ message: 'This is not a group chat!' });
         if (chat.groupAdmin.toString() !== requesterId.toString()) {
             return res.status(403).json({ message: 'Only the group admin can remove members!' });
         }
-        if (chat.groupAdmin.toString() === removeMemberId) {
-            return res.status(400).json({ message: 'Admin cannot be removed from the group!' });
-        }
 
         const updated = await Chat.findByIdAndUpdate(
-            req.params.chatId,
+            chatId,
             { $pull: { members: removeMemberId } },
             { returnDocument: 'after' }
         ).populate([
@@ -239,33 +313,34 @@ router.patch('/removeFromGroup/:chatId', authMiddleware, async (req, res) => {
             { path: 'groupAdmin', select: '-password' }
         ]);
 
-        res.status(200).json({ chat: updated });
+        res.status(200).json({ message: 'Member removed successfully!', chat: updated });
     } catch (err) {
-        console.error('Error removing member from group:', err);
-        res.status(500).json({ message: 'Removing member from group failed!', error: err.message });
+        console.error('Error removing member:', err);
+        res.status(500).json({ message: 'Removing member failed!', error: err.message });
     }
-});
+};
+
+router.put(['/removeGroupMember', '/removeFromGroup', '/removeFromGroup/:chatId'], authMiddleware, removeMemberHandler);
+router.patch(['/removeGroupMember', '/removeFromGroup', '/removeFromGroup/:chatId'], authMiddleware, removeMemberHandler);
 
 // ─────────────────────────────────────────────────────────
-// PATCH /api/chat/leaveGroup/:chatId
-// Leave a group chat (any member can leave; if admin leaves, assign new admin)
+// PUT or PATCH /api/chat/leaveGroup OR /api/chat/leaveGroup/:chatId
+// Leave group chat
 // ─────────────────────────────────────────────────────────
-router.patch('/leaveGroup/:chatId', authMiddleware, async (req, res) => {
+const leaveGroupHandler = async (req, res) => {
     try {
+        const chatId = req.params.chatId || req.body?.chatId;
         const userId = req.userData?.userId || req.userData?.id;
 
-        const chat = await Chat.findById(req.params.chatId);
+        if (!chatId) return res.status(400).json({ message: 'Chat ID is required!' });
+
+        const chat = await Chat.findById(chatId);
         if (!chat) return res.status(404).json({ message: 'Chat not found!' });
         if (!chat.isGroupChat) return res.status(400).json({ message: 'This is not a group chat!' });
 
-        const memberIds = chat.members.map(m => m.toString());
-        if (!memberIds.includes(userId.toString())) {
-            return res.status(400).json({ message: 'You are not a member of this group!' });
-        }
-
         const updatePayload = { $pull: { members: userId } };
+        const memberIds = chat.members.map(m => m.toString());
 
-        // If admin is leaving, assign admin role to next member
         if (chat.groupAdmin.toString() === userId.toString()) {
             const nextAdmin = memberIds.find(id => id !== userId.toString());
             if (nextAdmin) {
@@ -274,7 +349,7 @@ router.patch('/leaveGroup/:chatId', authMiddleware, async (req, res) => {
         }
 
         const updated = await Chat.findByIdAndUpdate(
-            req.params.chatId,
+            chatId,
             updatePayload,
             { returnDocument: 'after' }
         ).populate([
@@ -282,11 +357,14 @@ router.patch('/leaveGroup/:chatId', authMiddleware, async (req, res) => {
             { path: 'groupAdmin', select: '-password' }
         ]);
 
-        res.status(200).json({ message: 'Left the group successfully!', chat: updated });
+        res.status(200).json({ message: 'You have left the group chat.', chat: updated });
     } catch (err) {
         console.error('Error leaving group:', err);
         res.status(500).json({ message: 'Leaving group failed!', error: err.message });
     }
-});
+};
+
+router.put(['/leaveGroup', '/leaveGroup/:chatId'], authMiddleware, leaveGroupHandler);
+router.patch(['/leaveGroup', '/leaveGroup/:chatId'], authMiddleware, leaveGroupHandler);
 
 module.exports = router;

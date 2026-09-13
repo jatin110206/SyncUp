@@ -16,6 +16,17 @@ process.on('uncaughtException', (err) => {
 
 const server = http.createServer(app);
 
+// Handle server startup errors (e.g. EADDRINUSE)
+server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+        console.error(`💥 Port ${process.env.PORT_NUMBER || 3000} is already in use by another process.`);
+        console.error(`Run 'lsof -ti :${process.env.PORT_NUMBER || 3000} | xargs kill -9' to free the port.`);
+    } else {
+        console.error('Server error:', err);
+    }
+    process.exit(1);
+});
+
 // Initialize Socket.io
 initSocket(server);
 

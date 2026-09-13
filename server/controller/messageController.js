@@ -24,18 +24,41 @@ router.post('/newMessage', authMiddleware, async (req, res) => {
             return res.status(400).json({ message: 'Sender ID is required!' });
         }
 
+        // Block safeguard check for 1-on-1 chats
+        const chatDoc = await Chat.findById(chatId);
+        if (chatDoc && !chatDoc.isGroupChat && chatDoc.members) {
+            const recipientId = chatDoc.members.find(m => m.toString() !== senderId.toString());
+            if (recipientId) {
+                const User = require('../model/user');
+                const [senderUser, recipientUser] = await Promise.all([
+                    User.findById(senderId),
+                    User.findById(recipientId)
+                ]);
+                const senderBlocked = senderUser?.blockedUsers?.some(bId => bId.toString() === recipientId.toString());
+                const recipientBlocked = recipientUser?.blockedUsers?.some(bId => bId.toString() === senderId.toString());
+                if (senderBlocked || recipientBlocked) {
+                    return res.status(403).json({ message: 'Messaging is disabled because one of you has blocked the other.' });
+                }
+            }
+        }
+
         let imageUrl = null;
 
-        // If image is a base64 string, upload to Cloudinary
+        // Upload base64 image to Cloudinary if provided
         if (image) {
             if (image.startsWith('data:')) {
-                const uploadResponse = await cloudinary.uploader.upload(image, {
-                    folder: 'chat_images',
-                    resource_type: 'image'
-                });
-                imageUrl = uploadResponse.secure_url;
+                try {
+                    const uploadResponse = await cloudinary.uploader.upload(image, {
+                        folder: 'chat_images',
+                        resource_type: 'image'
+                    });
+                    imageUrl = uploadResponse.secure_url;
+                } catch (uploadErr) {
+                    console.warn('Cloudinary upload failed, saving base64 directly:', uploadErr.message);
+                    // Fallback: save the base64 data URL directly so the image still shows
+                    imageUrl = image;
+                }
             } else {
-                // Assume it's already a URL
                 imageUrl = image;
             }
         }
@@ -58,6 +81,22 @@ router.post('/newMessage', authMiddleware, async (req, res) => {
         // Populate sender details for response
         const populated = await savedMessage.populate('sender', '-password');
 
+        // Broadcast real-time message to all chat members via socket.io
+        try {
+            const { getIO } = require('../socket/socket');
+            const io = getIO();
+            const chatObj = await Chat.findById(chatId);
+            if (chatObj && chatObj.members) {
+                chatObj.members.forEach((mId) => {
+                    const mStr = mId.toString();
+                    io.to(mStr).emit('receive-message', populated);
+                });
+            }
+            io.to(chatId.toString()).emit('receive-message', populated);
+        } catch (socketErr) {
+            console.error('[messageController] Socket broadcast error:', socketErr.message);
+        }
+
         res.status(201).json({ message: populated });
     } catch (err) {
         console.error('Error sending new message:', err);
@@ -66,10 +105,10 @@ router.post('/newMessage', authMiddleware, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────
-// GET /api/message/allMessages/:chatId
+// GET /api/message/getMessages/:chatId OR /api/message/allMessages/:chatId
 // Fetch all messages in a chat (oldest first)
 // ─────────────────────────────────────────────────────────
-router.get('/allMessages/:chatId', authMiddleware, async (req, res) => {
+router.get(['/getMessages/:chatId', '/allMessages/:chatId'], authMiddleware, async (req, res) => {
     try {
         const allMessages = await Message.find({ chatId: req.params.chatId })
             .populate('sender', '-password')
@@ -77,27 +116,25 @@ router.get('/allMessages/:chatId', authMiddleware, async (req, res) => {
 
         res.status(200).json({ messages: allMessages });
     } catch (err) {
-        console.error('Error fetching all messages:', err);
+        console.error('Error fetching messages:', err);
         res.status(500).json({ message: 'Fetching messages failed!', error: err.message });
     }
 });
 
 // ─────────────────────────────────────────────────────────
-// PATCH /api/message/read/:chatId
+// PUT or PATCH /api/message/markAsRead/:chatId OR /api/message/read/:chatId
 // Mark all messages in a chat as read and reset unread count
 // ─────────────────────────────────────────────────────────
-router.patch('/read/:chatId', authMiddleware, async (req, res) => {
+const markAsReadHandler = async (req, res) => {
     try {
         const { chatId } = req.params;
         const userId = req.userData?.userId || req.userData?.id;
 
-        // Mark all unread messages not sent by the current user as read
         await Message.updateMany(
             { chatId, read: false, sender: { $ne: userId } },
             { $set: { read: true } }
         );
 
-        // Reset the unread count on the chat
         await Chat.findByIdAndUpdate(chatId, { $set: { unreadCount: 0 } });
 
         res.status(200).json({ message: 'Messages marked as read!' });
@@ -105,13 +142,16 @@ router.patch('/read/:chatId', authMiddleware, async (req, res) => {
         console.error('Error marking messages as read:', err);
         res.status(500).json({ message: 'Marking messages as read failed!', error: err.message });
     }
-});
+};
+
+router.put(['/markAsRead/:chatId', '/read/:chatId'], authMiddleware, markAsReadHandler);
+router.patch(['/markAsRead/:chatId', '/read/:chatId'], authMiddleware, markAsReadHandler);
 
 // ─────────────────────────────────────────────────────────
-// PATCH /api/message/:messageId
-// Edit a message (only the sender can edit, within their own messages)
+// PUT or PATCH /api/message/editMessage/:messageId OR /api/message/:messageId
+// Edit a message (sender only)
 // ─────────────────────────────────────────────────────────
-router.patch('/:messageId', authMiddleware, async (req, res) => {
+const editMessageHandler = async (req, res) => {
     try {
         const { messageId } = req.params;
         const { text } = req.body || {};
@@ -126,7 +166,6 @@ router.patch('/:messageId', authMiddleware, async (req, res) => {
             return res.status(404).json({ message: 'Message not found!' });
         }
 
-        // Ownership check
         if (message.sender.toString() !== userId.toString()) {
             return res.status(403).json({ message: 'You can only edit your own messages!' });
         }
@@ -141,18 +180,21 @@ router.patch('/:messageId', authMiddleware, async (req, res) => {
             { returnDocument: 'after' }
         ).populate('sender', '-password');
 
-        res.status(200).json({ message: updatedMessage });
+        res.status(200).json({ message: 'Message edited successfully!', data: updatedMessage });
     } catch (err) {
         console.error('Error editing message:', err);
         res.status(500).json({ message: 'Editing message failed!', error: err.message });
     }
-});
+};
+
+router.put(['/editMessage/:messageId', '/:messageId'], authMiddleware, editMessageHandler);
+router.patch(['/editMessage/:messageId', '/:messageId'], authMiddleware, editMessageHandler);
 
 // ─────────────────────────────────────────────────────────
-// DELETE /api/message/:messageId
-// Soft delete a message (only the sender can delete)
+// DELETE /api/message/deleteMessage/:messageId OR /api/message/:messageId
+// Soft delete a message (sender only)
 // ─────────────────────────────────────────────────────────
-router.delete('/:messageId', authMiddleware, async (req, res) => {
+router.delete(['/deleteMessage/:messageId', '/:messageId'], authMiddleware, async (req, res) => {
     try {
         const { messageId } = req.params;
         const userId = req.userData?.userId || req.userData?.id;
@@ -162,19 +204,17 @@ router.delete('/:messageId', authMiddleware, async (req, res) => {
             return res.status(404).json({ message: 'Message not found!' });
         }
 
-        // Ownership check
         if (message.sender.toString() !== userId.toString()) {
             return res.status(403).json({ message: 'You can only delete your own messages!' });
         }
 
-        // Soft delete: replace content, keep document for chat history integrity
         const deletedMessage = await Message.findByIdAndUpdate(
             messageId,
             { $set: { text: 'This message was deleted', image: null, isDeleted: true } },
             { returnDocument: 'after' }
         ).populate('sender', '-password');
 
-        res.status(200).json({ message: deletedMessage });
+        res.status(200).json({ message: 'Message deleted successfully!', data: deletedMessage });
     } catch (err) {
         console.error('Error deleting message:', err);
         res.status(500).json({ message: 'Deleting message failed!', error: err.message });

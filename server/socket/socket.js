@@ -1,7 +1,8 @@
 const { Server } = require('socket.io');
+const Chat = require('../model/chat');
 
 let io;
-// Map to store online users: userId -> socket.id
+// Map to store online users: userId -> socketId
 const onlineUsers = new Map();
 
 function initSocket(server) {
@@ -22,18 +23,44 @@ function initSocket(server) {
     io.on('connection', (socket) => {
         console.log(`[Socket] User connected: ${socket.id}`);
 
-        // Register user as online
-        socket.on('user-online', (userId) => {
-            if (userId) {
-                onlineUsers.set(userId, socket.id);
-                socket.userId = userId;
-                console.log(`[Socket] User registered: ${userId} (${socket.id})`);
-                // Broadcast updated online users list
-                io.emit('get-online-users', Array.from(onlineUsers.keys()));
+        // Register user as online and auto-join all their chat rooms
+        socket.on('user-online', async (userId) => {
+            if (!userId) return;
+
+            const uIdStr = userId.toString();
+            onlineUsers.set(uIdStr, socket.id);
+            socket.userId = uIdStr;
+
+            // Join personal room for direct user-targeted socket broadcasts
+            socket.join(uIdStr);
+            console.log(`[Socket] User registered: ${uIdStr} (${socket.id})`);
+
+            // Auto-join all chat rooms this user belongs to
+            // so they receive real-time messages in ALL chats, not just the open one
+            try {
+                const userChats = await Chat.find(
+                    { members: { $in: [userId] } },
+                    { _id: 1 } // only need the IDs
+                );
+                const chatIds = userChats.map((c) => c._id.toString());
+                for (const chatId of chatIds) {
+                    socket.join(chatId);
+                }
+                console.log(`[Socket] User ${userId} auto-joined ${chatIds.length} chat rooms`);
+            } catch (err) {
+                console.error('[Socket] Error auto-joining chat rooms:', err.message);
             }
+
+            // Broadcast updated online users list to ALL clients
+            io.emit('get-online-users', Array.from(onlineUsers.keys()));
         });
 
-        // Join a specific chat room
+        // Client requests current online users list (e.g. after reconnect)
+        socket.on('request-online-users', () => {
+            socket.emit('get-online-users', Array.from(onlineUsers.keys()));
+        });
+
+        // Join a specific chat room (still supported for when user opens a chat)
         socket.on('join-chat', (chatId) => {
             if (chatId) {
                 socket.join(chatId);
@@ -54,19 +81,40 @@ function initSocket(server) {
             if (data && data.chatId) {
                 // Broadcast to everyone in the chat room except the sender
                 socket.to(data.chatId).emit('receive-message', data);
+                console.log(`[Socket] Message relayed to room: ${data.chatId}`);
             }
         });
 
         // Real-time typing indicators
-        socket.on('typing', ({ chatId, userId, firstname }) => {
+        socket.on('typing', async ({ chatId, userId, firstname }) => {
             if (chatId) {
-                socket.to(chatId).emit('user-typing', { chatId, userId, firstname });
+                socket.to(chatId.toString()).emit('user-typing', { chatId, userId, firstname });
+                try {
+                    const chatObj = await Chat.findById(chatId);
+                    if (chatObj && chatObj.members) {
+                        chatObj.members.forEach((mId) => {
+                            if (mId.toString() !== userId?.toString()) {
+                                io.to(mId.toString()).emit('user-typing', { chatId, userId, firstname });
+                            }
+                        });
+                    }
+                } catch (err) {}
             }
         });
 
-        socket.on('stop-typing', ({ chatId, userId }) => {
+        socket.on('stop-typing', async ({ chatId, userId }) => {
             if (chatId) {
-                socket.to(chatId).emit('user-stop-typing', { chatId, userId });
+                socket.to(chatId.toString()).emit('user-stop-typing', { chatId, userId });
+                try {
+                    const chatObj = await Chat.findById(chatId);
+                    if (chatObj && chatObj.members) {
+                        chatObj.members.forEach((mId) => {
+                            if (mId.toString() !== userId?.toString()) {
+                                io.to(mId.toString()).emit('user-stop-typing', { chatId, userId });
+                            }
+                        });
+                    }
+                } catch (err) {}
             }
         });
 
@@ -77,7 +125,7 @@ function initSocket(server) {
                 console.log(`[Socket] User disconnected: ${socket.userId}`);
                 io.emit('get-online-users', Array.from(onlineUsers.keys()));
             } else {
-                console.log(`[Socket] Socket disconnected: ${socket.id}`);
+                console.log(`[Socket] Socket disconnected (anonymous): ${socket.id}`);
             }
         });
     });

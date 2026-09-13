@@ -22,6 +22,15 @@ const userSchema = new mongoose.Schema({
         type: String,
         required: true
     },
+    username: {
+        type: String,
+        unique: true,
+        sparse: true,
+        lowercase: true,
+        trim: true,
+        minlength: 3,
+        maxlength: 30
+    },
     profileImage: {
         type: String,
         default: null
@@ -39,7 +48,11 @@ const userSchema = new mongoose.Schema({
         type: String,
         default: 'Hey there! I am using SyncUp.',
         maxlength: 100
-    }
+    },
+    blockedUsers: [{
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User'
+    }]
 }, {
     timestamps: true
 });

@@ -5,7 +5,7 @@ const jwt = require('jsonwebtoken');
 
 router.post('/signup', async (req, res) => {
     try {
-        const { firstname, lastname, email, password, profileImage } = req.body || {};
+        const { firstname, lastname, email, password, username, profileImage } = req.body || {};
         if (!firstname || !lastname || !email || !password) {
             return res.status(400).json({ message: 'All fields are required' });
         }
@@ -13,6 +13,22 @@ router.post('/signup', async (req, res) => {
         const existingUser = await User.findOne({ email });
         if (existingUser) {
             return res.status(400).json({ message: 'User already exists' });
+        }
+
+        let customUsername = username ? username.trim().toLowerCase().replace(/^@/, '') : '';
+        if (customUsername) {
+            if (!/^[a-zA-Z0-9._\-\/]{1,50}$/.test(customUsername)) {
+                return res.status(400).json({ message: 'User ID can only contain letters, numbers, underscores, hyphens, dots, and slashes.' });
+            }
+            const existingUsername = await User.findOne({ username: customUsername });
+            if (existingUsername) {
+                return res.status(400).json({ message: 'This Unique User ID is already taken. Please choose another one.' });
+            }
+        } else {
+            // Auto-generate default unique username based on firstname + 4 digits
+            const base = firstname.toLowerCase().replace(/[^a-z0-9]/g, '') || 'user';
+            const randomDigits = Math.floor(1000 + Math.random() * 9000);
+            customUsername = `${base}${randomDigits}`;
         }
 
         const saltRounds = 10;
@@ -23,6 +39,7 @@ router.post('/signup', async (req, res) => {
             lastname,
             email,
             password: hashedPassword,
+            username: customUsername,
             profileImage
         });
 
