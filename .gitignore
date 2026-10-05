@@ -1,5 +1,6 @@
 # Secrets
 config.env
+.env.example
 .env
 .env.local
 .env.production
