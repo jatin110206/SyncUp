@@ -5,16 +5,28 @@ let io;
 // Map to store online users: userId -> socketId
 const onlineUsers = new Map();
 
+function isOriginAllowed(origin) {
+    if (!origin) return true;
+    if (process.env.NODE_ENV !== 'production') return true;
+    if (origin.startsWith('http://localhost:') || origin.startsWith('http://127.0.0.1:')) return true;
+    if (/^https:\/\/.*\.vercel\.app$/.test(origin)) return true;
+    if (process.env.CLIENT_URL) {
+        const clientUrls = process.env.CLIENT_URL.split(',').map(u => u.trim().replace(/\/$/, ''));
+        if (clientUrls.includes(origin.replace(/\/$/, ''))) return true;
+    }
+    return false;
+}
+
 function initSocket(server) {
     io = new Server(server, {
         cors: {
-            origin: [
-                'http://localhost:5173',
-                'http://localhost:3000',
-                'http://127.0.0.1:5173',
-                'http://127.0.0.1:3000',
-                process.env.CLIENT_URL
-            ].filter(Boolean),
+            origin: function (origin, callback) {
+                if (isOriginAllowed(origin)) {
+                    callback(null, true);
+                } else {
+                    callback(new Error(`Socket CORS: Origin ${origin} not allowed`));
+                }
+            },
             methods: ['GET', 'POST'],
             credentials: true
         }

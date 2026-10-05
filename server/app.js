@@ -22,21 +22,21 @@ app.use(helmet({
 // ─────────────────────────────────────────────────────────
 // 2. CORS Configuration
 // ─────────────────────────────────────────────────────────
-const allowedOrigins = [
-    'http://localhost:5173',
-    'http://localhost:3000',
-    'http://127.0.0.1:5173',
-    'http://127.0.0.1:3000',
-    process.env.CLIENT_URL
-].filter(Boolean);
+function isOriginAllowed(origin) {
+    if (!origin) return true;
+    if (process.env.NODE_ENV !== 'production') return true;
+    if (origin.startsWith('http://localhost:') || origin.startsWith('http://127.0.0.1:')) return true;
+    if (/^https:\/\/.*\.vercel\.app$/.test(origin)) return true;
+    if (process.env.CLIENT_URL) {
+        const clientUrls = process.env.CLIENT_URL.split(',').map(u => u.trim().replace(/\/$/, ''));
+        if (clientUrls.includes(origin.replace(/\/$/, ''))) return true;
+    }
+    return false;
+}
 
 app.use(cors({
     origin: function (origin, callback) {
-        // Allow server-to-server requests (no origin) or listed origins
-        if (!origin || allowedOrigins.includes(origin)) {
-            callback(null, true);
-        } else if (process.env.NODE_ENV !== 'production') {
-            // Permissive in development
+        if (isOriginAllowed(origin)) {
             callback(null, true);
         } else {
             callback(new Error(`CORS: Origin ${origin} not allowed`));
