@@ -105,8 +105,16 @@ app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/signup', authLimiter);
 
 // ─────────────────────────────────────────────────────────
-// 5. Health Check Endpoint
+// 5. Health Check & Root Endpoints
 // ─────────────────────────────────────────────────────────
+app.get('/', (req, res) => {
+    res.status(200).json({
+        status: 'success',
+        message: 'SyncUp API & WebSocket Server is running!',
+        health: '/health'
+    });
+});
+
 app.get('/health', (req, res) => {
     const dbState = mongoose.connection.readyState;
     const dbStatusMap = {
